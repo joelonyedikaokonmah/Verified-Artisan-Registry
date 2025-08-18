@@ -29,7 +29,10 @@
     location: (string-ascii 100),
     validated: bool,
     validation-count: uint,
-    created-at: uint
+    created-at: uint,
+    reputation-score: uint,
+    total-sales: uint,
+    featured-until: uint
 })
 
 (define-map validators principal {
@@ -95,7 +98,10 @@
             location: location,
             validated: false,
             validation-count: u0,
-            created-at: stacks-block-height
+            created-at: stacks-block-height,
+            reputation-score: u50,
+            total-sales: u0,
+            featured-until: u0
         })
         (var-set next-artisan-id (+ artisan-id u1))
         (ok artisan-id)))
@@ -151,10 +157,17 @@
         (ok product-id)))
 
 (define-public (transfer-product (product-id uint) (new-owner principal))
-    (let ((current-owner (unwrap! (map-get? product-ownership product-id) ERR-NOT-FOUND)))
+    (let (
+        (current-owner (unwrap! (map-get? product-ownership product-id) ERR-NOT-FOUND))
+        (product (unwrap! (map-get? products product-id) ERR-NOT-FOUND))
+        (artisan-id (get artisan-id product))
+        (artisan (unwrap! (map-get? artisans artisan-id) ERR-NOT-FOUND))
+    )
         (asserts! (not (var-get contract-paused)) ERR-UNAUTHORIZED)
         (asserts! (is-eq tx-sender current-owner) ERR-UNAUTHORIZED)
-        (ok (map-set product-ownership product-id new-owner))))
+        (map-set product-ownership product-id new-owner)
+        (try! (update-reputation artisan-id u5))
+        (ok true)))
 
 (define-public (update-validation-threshold (new-threshold uint))
     (begin
@@ -171,6 +184,44 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
         (ok (var-set contract-paused false))))
+
+(define-private (update-reputation (artisan-id uint) (points uint))
+    (let ((artisan (unwrap! (map-get? artisans artisan-id) ERR-NOT-FOUND)))
+        (let (
+            (current-score (get reputation-score artisan))
+            (new-score (+ current-score points))
+            (capped-score (if (> new-score u100) u100 new-score))
+            (new-sales (+ (get total-sales artisan) u1))
+        )
+            (ok (map-set artisans artisan-id (merge artisan {
+                reputation-score: capped-score,
+                total-sales: new-sales
+            }))))))
+
+(define-public (set-featured-artisan (artisan-id uint) (blocks uint))
+    (let ((artisan (unwrap! (map-get? artisans artisan-id) ERR-NOT-FOUND)))
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (>= (get reputation-score artisan) u80) ERR-VALIDATION-FAILED)
+        (ok (map-set artisans artisan-id (merge artisan {
+            featured-until: (+ stacks-block-height blocks)
+        })))))
+
+(define-read-only (is-featured-artisan (artisan-id uint))
+    (match (map-get? artisans artisan-id)
+        artisan (>= (get featured-until artisan) stacks-block-height)
+        false))
+
+(define-read-only (get-artisan-reputation (artisan-id uint))
+    (match (map-get? artisans artisan-id)
+        artisan (some {
+            reputation-score: (get reputation-score artisan),
+            total-sales: (get total-sales artisan),
+            is-featured: (>= (get featured-until artisan) stacks-block-height)
+        })
+        none))
+
+(define-read-only (get-top-artisans)
+    (ok true))
 
 (define-read-only (get-artisan (artisan-id uint))
     (map-get? artisans artisan-id))
