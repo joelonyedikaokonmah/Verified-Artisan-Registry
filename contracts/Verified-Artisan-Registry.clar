@@ -17,6 +17,12 @@
 (define-constant ERR-ALREADY-VALIDATED (err u410))
 (define-constant ERR-VALIDATION-FAILED (err u411))
 (define-constant ERR-INVALID-PRODUCT (err u412))
+(define-constant ERR-INSUFFICIENT-PAYMENT (err u413))
+(define-constant ERR-ORDER-NOT-FOUND (err u414))
+(define-constant ERR-ORDER-ALREADY-EXISTS (err u415))
+(define-constant ERR-INVALID-ORDER-STATUS (err u416))
+(define-constant ERR-NOT-BUYER-OR-SELLER (err u417))
+(define-constant ERR-DISPUTE-TIMEOUT (err u418))
 
 (define-data-var next-artisan-id uint u1)
 (define-data-var validation-threshold uint u3)
@@ -58,7 +64,23 @@
 
 (define-map product-ownership uint principal)
 
+(define-map escrow-orders uint {
+    product-id: uint,
+    buyer: principal,
+    seller: principal,
+    amount: uint,
+    status: (string-ascii 20),
+    created-at: uint,
+    delivered-at: (optional uint),
+    dispute-started-at: (optional uint),
+    auto-release-at: uint
+})
+
+(define-map escrow-balances uint uint)
+
 (define-data-var next-product-id uint u1)
+(define-data-var next-order-id uint u1)
+(define-data-var dispute-timeout-blocks uint u1008)
 
 (define-read-only (get-last-token-id)
     (ok (- (var-get next-artisan-id) u1)))
@@ -264,10 +286,131 @@
 (define-read-only (get-artisan-products (artisan-id uint))
     (ok true))
 
+(define-public (purchase-product (product-id uint))
+    (let (
+        (product (unwrap! (map-get? products product-id) ERR-NOT-FOUND))
+        (artisan (unwrap! (map-get? artisans (get artisan-id product)) ERR-NOT-FOUND))
+        (order-id (var-get next-order-id))
+        (price (get price product))
+        (seller (get owner artisan))
+        (auto-release-block (+ stacks-block-height (var-get dispute-timeout-blocks)))
+    )
+        (asserts! (not (var-get contract-paused)) ERR-UNAUTHORIZED)
+        (asserts! (get validated artisan) ERR-VALIDATION-FAILED)
+        (asserts! (> price u0) ERR-INVALID-PRODUCT)
+        (asserts! (not (is-eq tx-sender seller)) ERR-UNAUTHORIZED)
+        
+        (try! (stx-transfer? price tx-sender (as-contract tx-sender)))
+        
+        (map-set escrow-orders order-id {
+            product-id: product-id,
+            buyer: tx-sender,
+            seller: seller,
+            amount: price,
+            status: "pending",
+            created-at: stacks-block-height,
+            delivered-at: none,
+            dispute-started-at: none,
+            auto-release-at: auto-release-block
+        })
+        
+        (map-set escrow-balances order-id price)
+        (var-set next-order-id (+ order-id u1))
+        (ok order-id)))
+
+(define-public (confirm-delivery (order-id uint))
+    (let (
+        (order (unwrap! (map-get? escrow-orders order-id) ERR-ORDER-NOT-FOUND))
+        (escrow-amount (unwrap! (map-get? escrow-balances order-id) ERR-ORDER-NOT-FOUND))
+    )
+        (asserts! (not (var-get contract-paused)) ERR-UNAUTHORIZED)
+        (asserts! (is-eq tx-sender (get buyer order)) ERR-NOT-BUYER-OR-SELLER)
+        (asserts! (is-eq (get status order) "pending") ERR-INVALID-ORDER-STATUS)
+        
+        (try! (as-contract (stx-transfer? escrow-amount tx-sender (get seller order))))
+        
+        (map-set escrow-orders order-id (merge order {
+            status: "completed",
+            delivered-at: (some stacks-block-height)
+        }))
+        
+        (map-delete escrow-balances order-id)
+        (try! (update-reputation (get product-id order) u10))
+        (ok true)))
+
+(define-public (start-dispute (order-id uint))
+    (let (
+        (order (unwrap! (map-get? escrow-orders order-id) ERR-ORDER-NOT-FOUND))
+    )
+        (asserts! (not (var-get contract-paused)) ERR-UNAUTHORIZED)
+        (asserts! (or (is-eq tx-sender (get buyer order)) (is-eq tx-sender (get seller order))) ERR-NOT-BUYER-OR-SELLER)
+        (asserts! (is-eq (get status order) "pending") ERR-INVALID-ORDER-STATUS)
+        
+        (ok (map-set escrow-orders order-id (merge order {
+            status: "disputed",
+            dispute-started-at: (some stacks-block-height)
+        })))))
+
+(define-public (resolve-dispute (order-id uint) (release-to-seller bool))
+    (let (
+        (order (unwrap! (map-get? escrow-orders order-id) ERR-ORDER-NOT-FOUND))
+        (escrow-amount (unwrap! (map-get? escrow-balances order-id) ERR-ORDER-NOT-FOUND))
+        (recipient (if release-to-seller (get seller order) (get buyer order)))
+    )
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (is-eq (get status order) "disputed") ERR-INVALID-ORDER-STATUS)
+        
+        (try! (as-contract (stx-transfer? escrow-amount tx-sender recipient)))
+        
+        (map-set escrow-orders order-id (merge order {
+            status: (if release-to-seller "completed" "refunded"),
+            delivered-at: (if release-to-seller (some stacks-block-height) none)
+        }))
+        
+        (map-delete escrow-balances order-id)
+        
+        (if release-to-seller
+            (update-reputation (get product-id order) u5)
+            (ok true))))
+
+(define-public (auto-release-payment (order-id uint))
+    (let (
+        (order (unwrap! (map-get? escrow-orders order-id) ERR-ORDER-NOT-FOUND))
+        (escrow-amount (unwrap! (map-get? escrow-balances order-id) ERR-ORDER-NOT-FOUND))
+    )
+        (asserts! (not (var-get contract-paused)) ERR-UNAUTHORIZED)
+        (asserts! (is-eq (get status order) "pending") ERR-INVALID-ORDER-STATUS)
+        (asserts! (>= stacks-block-height (get auto-release-at order)) ERR-DISPUTE-TIMEOUT)
+        
+        (try! (as-contract (stx-transfer? escrow-amount tx-sender (get seller order))))
+        
+        (map-set escrow-orders order-id (merge order {
+            status: "auto-completed",
+            delivered-at: (some stacks-block-height)
+        }))
+        
+        (map-delete escrow-balances order-id)
+        (try! (update-reputation (get product-id order) u8))
+        (ok true)))
+
+(define-read-only (get-order (order-id uint))
+    (map-get? escrow-orders order-id))
+
+(define-read-only (get-order-balance (order-id uint))
+    (map-get? escrow-balances order-id))
+
+(define-read-only (can-auto-release (order-id uint))
+    (match (map-get? escrow-orders order-id)
+        order (and 
+            (is-eq (get status order) "pending")
+            (>= stacks-block-height (get auto-release-at order)))
+        false))
+
 (define-read-only (get-contract-stats)
     {
         total-artisans: (- (var-get next-artisan-id) u1),
         total-products: (- (var-get next-product-id) u1),
+        total-orders: (- (var-get next-order-id) u1),
         validation-threshold: (var-get validation-threshold),
         contract-paused: (var-get contract-paused)
     })
@@ -276,7 +419,7 @@
     (if (<= value u9)
         (unwrap-panic (element-at "0123456789" value))
         (get r (fold uint-to-ascii-inner 
-            0x000000000000000000000000000000000000000000000000000000000000000000000000 
+            0x000000000000000000000000000000000000000000000000000000000000000000000000
             {v: value, r: ""}))))
 
 (define-private (uint-to-ascii-inner (i (buff 1)) (d {v: uint, r: (string-ascii 39)}))
