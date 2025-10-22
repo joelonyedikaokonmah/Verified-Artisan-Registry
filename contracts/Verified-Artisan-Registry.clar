@@ -23,6 +23,12 @@
 (define-constant ERR-INVALID-ORDER-STATUS (err u416))
 (define-constant ERR-NOT-BUYER-OR-SELLER (err u417))
 (define-constant ERR-DISPUTE-TIMEOUT (err u418))
+(define-constant ERR-SKILL-NOT-FOUND (err u419))
+(define-constant ERR-ASSESSMENT-NOT-FOUND (err u420))
+(define-constant ERR-ASSESSMENT-ALREADY-TAKEN (err u421))
+(define-constant ERR-INSUFFICIENT-SCORE (err u422))
+(define-constant ERR-INVALID-SKILL-LEVEL (err u423))
+(define-constant ERR-CERTIFICATION-EXPIRED (err u424))
 
 (define-data-var next-artisan-id uint u1)
 (define-data-var validation-threshold uint u3)
@@ -78,9 +84,48 @@
 
 (define-map escrow-balances uint uint)
 
+;; Skills Assessment System Maps
+(define-map skills uint {
+    name: (string-ascii 100),
+    description: (string-ascii 500),
+    category: (string-ascii 50),
+    difficulty-level: uint,
+    created-by: principal,
+    active: bool,
+    passing-score: uint
+})
+
+(define-map assessments uint {
+    skill-id: uint,
+    artisan-id: uint,
+    score: uint,
+    max-score: uint,
+    passed: bool,
+    taken-at: uint,
+    expires-at: uint,
+    verified-by: (optional principal)
+})
+
+(define-map artisan-skills {artisan-id: uint, skill-id: uint} {
+    proficiency-level: uint,
+    assessment-id: uint,
+    certified: bool,
+    certification-date: uint,
+    expires-at: uint
+})
+
+(define-map skill-leaderboard {skill-id: uint, position: uint} {
+    artisan-id: uint,
+    score: uint,
+    assessment-date: uint
+})
+
 (define-data-var next-product-id uint u1)
 (define-data-var next-order-id uint u1)
 (define-data-var dispute-timeout-blocks uint u1008)
+(define-data-var next-skill-id uint u1)
+(define-data-var next-assessment-id uint u1)
+(define-data-var certification-validity-blocks uint u52560)
 
 (define-read-only (get-last-token-id)
     (ok (- (var-get next-artisan-id) u1)))
@@ -429,3 +474,168 @@
             r: (unwrap-panic (as-max-len? (concat (unwrap-panic (element-at "0123456789" (mod (get v d) u10))) (get r d)) u39))
         }
         d))
+
+;; =====================================
+;; SKILLS ASSESSMENT SYSTEM FUNCTIONS
+;; =====================================
+
+;; Create a new skill category
+(define-public (create-skill (name (string-ascii 100)) (description (string-ascii 500)) (category (string-ascii 50)) (difficulty-level uint) (passing-score uint))
+    (let ((skill-id (var-get next-skill-id)))
+        (asserts! (not (var-get contract-paused)) ERR-UNAUTHORIZED)
+        (asserts! (and (>= difficulty-level u1) (<= difficulty-level u5)) ERR-INVALID-SKILL-LEVEL)
+        (asserts! (and (>= passing-score u1) (<= passing-score u100)) ERR-INVALID-SKILL-LEVEL)
+        
+        (map-set skills skill-id {
+            name: name,
+            description: description,
+            category: category,
+            difficulty-level: difficulty-level,
+            created-by: tx-sender,
+            active: true,
+            passing-score: passing-score
+        })
+        
+        (var-set next-skill-id (+ skill-id u1))
+        (ok skill-id)))
+
+;; Take a skill assessment
+(define-public (take-assessment (artisan-id uint) (skill-id uint) (score uint) (max-score uint))
+    (let (
+        (artisan (unwrap! (map-get? artisans artisan-id) ERR-NOT-FOUND))
+        (skill (unwrap! (map-get? skills skill-id) ERR-SKILL-NOT-FOUND))
+        (assessment-id (var-get next-assessment-id))
+        (skill-key {artisan-id: artisan-id, skill-id: skill-id})
+        (percentage-score (/ (* score u100) max-score))
+        (passed (>= percentage-score (get passing-score skill)))
+        (expires-at (+ stacks-block-height (var-get certification-validity-blocks)))
+    )
+        (asserts! (not (var-get contract-paused)) ERR-UNAUTHORIZED)
+        (asserts! (is-eq (get owner artisan) tx-sender) ERR-UNAUTHORIZED)
+        (asserts! (get active skill) ERR-SKILL-NOT-FOUND)
+        (asserts! (<= score max-score) ERR-INSUFFICIENT-SCORE)
+        (asserts! (is-none (map-get? artisan-skills skill-key)) ERR-ASSESSMENT-ALREADY-TAKEN)
+        
+        ;; Record the assessment
+        (map-set assessments assessment-id {
+            skill-id: skill-id,
+            artisan-id: artisan-id,
+            score: score,
+            max-score: max-score,
+            passed: passed,
+            taken-at: stacks-block-height,
+            expires-at: expires-at,
+            verified-by: none
+        })
+        
+        ;; Create skill record based on pass/fail
+        (if passed
+            (map-set artisan-skills skill-key {
+                proficiency-level: (get difficulty-level skill),
+                assessment-id: assessment-id,
+                certified: true,
+                certification-date: stacks-block-height,
+                expires-at: expires-at
+            })
+            (map-set artisan-skills skill-key {
+                proficiency-level: u0,
+                assessment-id: assessment-id,
+                certified: false,
+                certification-date: u0,
+                expires-at: u0
+            }))
+        
+        (var-set next-assessment-id (+ assessment-id u1))
+        (ok assessment-id)))
+
+;; Verify an assessment (for validators)
+(define-public (verify-assessment (assessment-id uint))
+    (let (
+        (assessment (unwrap! (map-get? assessments assessment-id) ERR-ASSESSMENT-NOT-FOUND))
+        (validator-info (unwrap! (map-get? validators tx-sender) ERR-NOT-VALIDATOR))
+    )
+        (asserts! (not (var-get contract-paused)) ERR-UNAUTHORIZED)
+        (asserts! (get approved validator-info) ERR-NOT-VALIDATOR)
+        (asserts! (get passed assessment) ERR-INSUFFICIENT-SCORE)
+        
+        (ok (map-set assessments assessment-id (merge assessment {
+            verified-by: (some tx-sender)
+        })))))
+
+;; Renew skill certification
+(define-public (renew-certification (artisan-id uint) (skill-id uint))
+    (let (
+        (artisan (unwrap! (map-get? artisans artisan-id) ERR-NOT-FOUND))
+        (skill-key {artisan-id: artisan-id, skill-id: skill-id})
+        (artisan-skill (unwrap! (map-get? artisan-skills skill-key) ERR-SKILL-NOT-FOUND))
+        (new-expires-at (+ stacks-block-height (var-get certification-validity-blocks)))
+    )
+        (asserts! (not (var-get contract-paused)) ERR-UNAUTHORIZED)
+        (asserts! (is-eq (get owner artisan) tx-sender) ERR-UNAUTHORIZED)
+        (asserts! (get certified artisan-skill) ERR-INSUFFICIENT-SCORE)
+        (asserts! (< (get expires-at artisan-skill) (+ stacks-block-height u5040)) ERR-CERTIFICATION-EXPIRED)
+        
+        (ok (map-set artisan-skills skill-key (merge artisan-skill {
+            expires-at: new-expires-at,
+            certification-date: stacks-block-height
+        })))))
+
+;; Update skill leaderboard
+(define-private (update-skill-leaderboard (skill-id uint) (artisan-id uint) (score uint))
+    (let ((position u1))
+        (map-set skill-leaderboard {skill-id: skill-id, position: position} {
+            artisan-id: artisan-id,
+            score: score,
+            assessment-date: stacks-block-height
+        })
+        (ok true)))
+
+;; Deactivate a skill (admin only)
+(define-public (deactivate-skill (skill-id uint))
+    (let ((skill (unwrap! (map-get? skills skill-id) ERR-SKILL-NOT-FOUND)))
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (ok (map-set skills skill-id (merge skill {
+            active: false
+        })))))
+
+;; =====================================
+;; SKILLS ASSESSMENT READ-ONLY FUNCTIONS
+;; =====================================
+
+(define-read-only (get-skill (skill-id uint))
+    (map-get? skills skill-id))
+
+(define-read-only (get-assessment (assessment-id uint))
+    (map-get? assessments assessment-id))
+
+(define-read-only (get-artisan-skill (artisan-id uint) (skill-id uint))
+    (map-get? artisan-skills {artisan-id: artisan-id, skill-id: skill-id}))
+
+(define-read-only (is-certification-valid (artisan-id uint) (skill-id uint))
+    (match (map-get? artisan-skills {artisan-id: artisan-id, skill-id: skill-id})
+        skill-info (and 
+            (get certified skill-info)
+            (>= (get expires-at skill-info) stacks-block-height))
+        false))
+
+(define-read-only (get-artisan-certifications (artisan-id uint))
+    (ok artisan-id))
+
+(define-read-only (get-skill-leaderboard (skill-id uint) (limit uint))
+    (ok skill-id))
+
+(define-read-only (get-skills-stats)
+    {
+        total-skills: (- (var-get next-skill-id) u1),
+        total-assessments: (- (var-get next-assessment-id) u1),
+        certification-validity-blocks: (var-get certification-validity-blocks)
+    })
+
+(define-read-only (calculate-artisan-skill-score (artisan-id uint))
+    (let ((artisan (unwrap! (map-get? artisans artisan-id) ERR-NOT-FOUND)))
+        (ok {
+            artisan-id: artisan-id,
+            base-reputation: (get reputation-score artisan),
+            skill-bonus: u0,
+            total-score: (get reputation-score artisan)
+        })))
