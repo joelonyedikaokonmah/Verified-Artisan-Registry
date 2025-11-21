@@ -29,6 +29,8 @@
 (define-constant ERR-INSUFFICIENT-SCORE (err u422))
 (define-constant ERR-INVALID-SKILL-LEVEL (err u423))
 (define-constant ERR-CERTIFICATION-EXPIRED (err u424))
+(define-constant ERR-BATCH-LIMIT-EXCEEDED (err u425))
+(define-constant ERR-BATCH-PROCESSING-FAILED (err u426))
 
 (define-data-var next-artisan-id uint u1)
 (define-data-var validation-threshold uint u3)
@@ -126,6 +128,7 @@
 (define-data-var next-skill-id uint u1)
 (define-data-var next-assessment-id uint u1)
 (define-data-var certification-validity-blocks uint u52560)
+(define-data-var max-batch-size uint u10)
 
 (define-read-only (get-last-token-id)
     (ok (- (var-get next-artisan-id) u1)))
@@ -172,6 +175,46 @@
         })
         (var-set next-artisan-id (+ artisan-id u1))
         (ok artisan-id)))
+
+(define-private (register-single-artisan (artisan-data {name: (string-ascii 50), specialty: (string-ascii 100), location: (string-ascii 100), owner: principal}) (prev-result (response (list 10 uint) uint)))
+    (let (
+        (current-list (unwrap! prev-result prev-result))
+        (artisan-id (var-get next-artisan-id))
+    )
+        (match (nft-mint? artisan-certificate artisan-id (get owner artisan-data))
+            success
+                (begin
+                    (map-set artisans artisan-id {
+                        owner: (get owner artisan-data),
+                        name: (get name artisan-data),
+                        specialty: (get specialty artisan-data),
+                        location: (get location artisan-data),
+                        validated: false,
+                        validation-count: u0,
+                        created-at: stacks-block-height,
+                        reputation-score: u50,
+                        total-sales: u0,
+                        featured-until: u0
+                    })
+                    (var-set next-artisan-id (+ artisan-id u1))
+                    (ok (unwrap! (as-max-len? (append current-list artisan-id) u10) ERR-BATCH-LIMIT-EXCEEDED)))
+            error ERR-BATCH-PROCESSING-FAILED)))
+
+(define-public (batch-register-artisans (artisan-list (list 10 {name: (string-ascii 50), specialty: (string-ascii 100), location: (string-ascii 100), owner: principal})))
+    (let (
+        (batch-size (len artisan-list))
+    )
+        (asserts! (not (var-get contract-paused)) ERR-UNAUTHORIZED)
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (> batch-size u0) ERR-BATCH-PROCESSING-FAILED)
+        (asserts! (<= batch-size (var-get max-batch-size)) ERR-BATCH-LIMIT-EXCEEDED)
+        (fold register-single-artisan artisan-list (ok (list)))))
+
+(define-public (set-max-batch-size (new-size uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+        (asserts! (and (> new-size u0) (<= new-size u50)) ERR-BATCH-LIMIT-EXCEEDED)
+        (ok (var-set max-batch-size new-size))))
 
 (define-public (validate-artisan (artisan-id uint))
     (let (
@@ -457,7 +500,8 @@
         total-products: (- (var-get next-product-id) u1),
         total-orders: (- (var-get next-order-id) u1),
         validation-threshold: (var-get validation-threshold),
-        contract-paused: (var-get contract-paused)
+        contract-paused: (var-get contract-paused),
+        max-batch-size: (var-get max-batch-size)
     })
 
 (define-read-only (uint-to-ascii (value uint))
